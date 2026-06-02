@@ -7,10 +7,11 @@ use futures_util::SinkExt;
 use serde::Serialize;
 use gpiod::{Chip, EdgeDetect, Options};
 
-const GPIO_PIN:   u32 = 27;
-const GAP_US:     Duration = Duration::from_micros(8000);
-const MIN_US:     Duration = Duration::from_micros(5);
-const MAX_PULSES: usize = 512;
+const GPIO_PIN:u32 = 27;
+const GAP:Duration = Duration::from_micros(5000);
+const GLITCH:Duration = Duration::from_micros(5);
+const MAX_PULSES: usize = 2048;
+const MIN_PULSES: usize = 10;
 const WS_PORT:    u16 = 8765;
 
 type Pulse = i32;
@@ -78,50 +79,67 @@ fn gpio_capture(tx: Arc<broadcast::Sender<Frame>>) -> Result<(), Box<dyn std::er
         .consumer("rf_2_ws");
     
     let mut current: Vec<Pulse> = Vec::with_capacity(MAX_PULSES);
-    let mut current_pulse: Duration = Duration::default();  // nécessaire pour absorber les glitchs (front <5us)
     
     let mut inputs = chip.request_lines(opts)?;
 
     println!("GPIO {GPIO_PIN} en écoute...");
 
-    // Lecture du premier front
-    let event = inputs.read_event()?;
+    // Attente du premier front
+    print!("Attente du premier GAP");
+    let event  = inputs.read_event()?;
     let mut last_tick: Duration = event.time;
-    let mut last_level: gpiod::Edge = event.edge;
+    let mut last_level: gpiod::Edge;
+    // Attente du premier GAP
+    loop {
+        let event = inputs.read_event()?;
+        let duration = last_tick.abs_diff(event.time);
+        print!(".");
+        last_tick  = event.time;
+        last_level = event.edge;
+        if duration > GAP {
+            println!(" {}", duration.as_micros());
+            break;
+        }
+    }
 
+    // main event loop
     loop {
         /* wait_edge est bloquant — parfait pour un thread dédié */
         let event = inputs.read_event()?;
-
         let duration = last_tick.abs_diff(event.time);
-        match last_tick.abs_diff(event.time) {
-            duration if duration < MIN_US => continue,
-            duration if ration < GAP_US =>
-        }
-        if duration < MIN_US {
-            current_pulse += duration;
+        
+        // Glitch cumulatif
+        if duration < GLITCH  && event.edge == last_level {
             continue;
         }
-
-        let prev_level  = last_level;
         last_tick  = event.time;
         last_level = event.edge;
-
-        if duration < GAP_US {
-
-
-            /* Fin de trame */
-            if current.len() > 10 {
+        
+        // Fin de trame
+        if duration > GAP || duration < GLITCH {
+            println!("GAP {}us, {}", duration.as_micros(), current.len());
+            if current.len() > MIN_PULSES {
                 let frame = Frame {
                     ts:     now_f64(),
                     pulses: current.clone(),
                 };
                 let _ = tx.send(frame);
                 println!("→ Trame capturée : {} pulses", current.len());
+                println!("→ Pulses : {:?}", &current[0..MIN_PULSES]);
             }
             current.clear();
-        } else if current.len() < MAX_PULSES {
-            current.push(Pulse(label, duration_us as u32));
+            continue;
         }
+
+        // Standard pulse
+        if current.len() >= MAX_PULSES {
+            print!(".");
+            continue;
+        }
+        let pulse = match last_level {
+            gpiod::Edge::Falling => duration.as_micros() as i32,
+            gpiod::Edge::Rising => -(duration.as_micros() as i32),
+        };
+        current.push(pulse);
     }
 }
